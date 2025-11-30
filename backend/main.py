@@ -8,7 +8,6 @@ app = FastAPI()
 
 # --- CONFIGURATION ---
 ROUND_DURATION = 60
-SELECTION_DURATION = 15 # Time to pick a word
 
 class Room:
     def __init__(self, room_id: str):
@@ -40,7 +39,6 @@ class ConnectionManager:
 
     async def connect(self, websocket: WebSocket, room_id: str, name: str):
         await websocket.accept()
-        
         if room_id not in self.rooms:
             self.rooms[room_id] = Room(room_id)
             print(f"Created Room: {room_id}")
@@ -48,20 +46,14 @@ class ConnectionManager:
         room = self.rooms[room_id]
         room.active_connections.append(websocket)
         room.names[websocket] = name
-        
-        if websocket not in room.scores:
-            room.scores[websocket] = 0
+        if websocket not in room.scores: room.scores[websocket] = 0
 
-        # Determine State
         current_role = "guesser"
-        if room.drawer == websocket: 
-            current_role = "drawer"
+        if room.drawer == websocket: current_role = "drawer"
         
         display_word = room.word_hint
-        if current_role == "drawer":
-            display_word = room.word
+        if current_role == "drawer": display_word = room.word
 
-        # Sync Game State
         await websocket.send_text(json.dumps({
             "type": "game_state",
             "role": current_role,
@@ -69,39 +61,32 @@ class ConnectionManager:
             "scores": self.get_leaderboard(room)
         }))
         
-        # Sync Canvas
         if room.draw_history:
              await websocket.send_text(json.dumps({
                 "type": "redraw",
                 "history": room.draw_history
             }))
 
-        # Check if we need to start
         if len(room.active_connections) >= 2 and not room.game_task and not room.drawer:
             await self.start_round_selection(room_id)
 
     def disconnect(self, websocket: WebSocket, room_id: str):
         if room_id in self.rooms:
             room = self.rooms[room_id]
-            
             if websocket in room.active_connections: room.active_connections.remove(websocket)
             if websocket in room.names: del room.names[websocket]
             if websocket in room.scores: del room.scores[websocket]
             if websocket in room.turn_queue: room.turn_queue.remove(websocket)
             
-            # If drawer left, reset
             if room.drawer == websocket:
-                print(f"Drawer left room {room_id}. Resetting.")
                 room.drawer = None
                 if room.game_task: room.game_task.cancel()
-                
                 if len(room.active_connections) >= 2:
                     asyncio.create_task(self.start_round_selection(room_id))
             
             if not room.active_connections:
                 if room.game_task: room.game_task.cancel()
                 del self.rooms[room_id]
-                print(f"Room {room_id} deleted.")
 
     def get_leaderboard(self, room: Room):
         leaderboard = []
@@ -118,15 +103,13 @@ class ConnectionManager:
                 try: await connection.send_text(json_msg)
                 except: self.disconnect(connection, room_id)
 
-    # --- PHASE 1: SELECT DRAWER & WORDS ---
     async def start_round_selection(self, room_id: str):
         room = self.rooms.get(room_id)
         if not room or len(room.active_connections) < 2: return
         if room.game_task: room.game_task.cancel()
 
-        room.draw_history = [] # Reset canvas
+        room.draw_history = [] 
 
-        # Pick Drawer
         if not room.turn_queue:
             room.turn_queue = [p for p in room.active_connections]
             random.shuffle(room.turn_queue)
@@ -142,72 +125,54 @@ class ConnectionManager:
             if room.active_connections: await self.start_round_selection(room_id)
             return
 
-        # Pick 3 Random Words
         word_choices = random.sample(self.word_list, 3)
-        
         drawer_name = room.names[room.drawer]
-        print(f"Selection Phase in {room_id}. Drawer: {drawer_name}")
 
-        # Send Choices to Drawer
         try:
             await room.drawer.send_text(json.dumps({
-                "type": "choose_word",
-                "words": word_choices,
-                "drawer_name": drawer_name
+                "type": "choose_word", "words": word_choices, "drawer_name": drawer_name
             }))
         except:
             self.disconnect(room.drawer, room_id)
             await self.start_round_selection(room_id)
             return
 
-        # Tell Guessers to Wait
         for sock in room.active_connections:
             if sock != room.drawer:
                 await sock.send_text(json.dumps({
-                    "type": "choosing",
-                    "message": f"{drawer_name} is choosing a word...",
-                    "drawer_name": drawer_name
+                    "type": "choosing", "message": f"{drawer_name} is choosing a word...", "drawer_name": drawer_name
                 }))
 
-        # Start Selection Timeout (Auto-pick if they are slow)
         room.game_task = asyncio.create_task(self.selection_timeout(room_id, word_choices[0]))
 
     async def selection_timeout(self, room_id: str, default_word: str):
         try:
-            await asyncio.sleep(SELECTION_DURATION)
-            # If we get here, they didn't pick. Auto-pick.
+            await asyncio.sleep(15)
             await self.start_actual_game(room_id, default_word)
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError: pass
 
-    # --- PHASE 2: START GAME LOOP ---
     async def start_actual_game(self, room_id: str, selected_word: str):
         room = self.rooms.get(room_id)
         if not room: return
-        if room.game_task: room.game_task.cancel() # Cancel selection timeout
+        if room.game_task: room.game_task.cancel()
 
         room.word = selected_word
         room.word_hint = "_ " * len(room.word)
         room.guessed_count = 0
         drawer_name = room.names[room.drawer]
 
-        # Broadcast Start
         await self.broadcast({
-            "type": "new_round",
-            "role": "guesser", # Default for everyone
-            "word": room.word_hint,
-            "drawer_name": drawer_name,
-            "round_time": ROUND_DURATION
+            "type": "new_round", "role": "guesser", "word": room.word_hint, "drawer_name": drawer_name, "round_time": ROUND_DURATION
         }, room_id)
 
-        # Override for Drawer (Show real word)
-        await room.drawer.send_text(json.dumps({
-            "type": "new_round",
-            "role": "drawer",
-            "word": room.word,
-            "drawer_name": drawer_name,
-            "round_time": ROUND_DURATION
-        }))
+        try:
+            await room.drawer.send_text(json.dumps({
+                "type": "new_round", "role": "drawer", "word": room.word, "drawer_name": drawer_name, "round_time": ROUND_DURATION
+            }))
+        except:
+            self.disconnect(room.drawer, room_id)
+            await self.start_round_selection(room_id)
+            return
 
         room.game_task = asyncio.create_task(self.game_timer(room_id))
 
@@ -239,17 +204,14 @@ class ConnectionManager:
     async def handle_message(self, websocket: WebSocket, data: str, room_id: str):
         room = self.rooms.get(room_id)
         if not room: return
-        
         try:
             msg_data = json.loads(data)
             
-            # --- WORD SELECTION ---
             if msg_data.get("type") == "word_select":
                 if websocket == room.drawer:
                     word = msg_data.get("word")
                     if word: await self.start_actual_game(room_id, word)
 
-            # --- DRAWING ---
             elif msg_data.get("type") in ["draw", "fill"]:
                 if websocket == room.drawer: 
                     room.draw_history.append(msg_data)
@@ -260,12 +222,22 @@ class ConnectionManager:
                     room.draw_history = []
                     await self.broadcast(msg_data, room_id)
             
+            # --- SMART UNDO LOGIC ---
             elif msg_data.get("type") == "undo":
                 if websocket == room.drawer and room.draw_history:
-                    room.draw_history.pop()
+                    # Find the last stroke ID
+                    last_action = room.draw_history[-1]
+                    last_stroke_id = last_action.get("strokeId")
+                    
+                    if last_stroke_id:
+                        # Remove ALL items with this stroke ID (The whole line)
+                        room.draw_history = [x for x in room.draw_history if x.get("strokeId") != last_stroke_id]
+                    else:
+                        # Fallback for old data: just pop one
+                        room.draw_history.pop()
+                        
                     await self.broadcast({"type": "redraw", "history": room.draw_history}, room_id)
             
-            # --- CHAT ---
             elif msg_data.get("type") == "chat":
                 if websocket == room.drawer: return 
                 guess = msg_data["message"].strip().lower()
